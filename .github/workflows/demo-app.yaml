@@ -67,6 +67,6 @@ jobs:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           sed "s|IMAGE_PLACEHOLDER|${IMAGE}|" demo-app/k8s/app.yaml \
-            | ssh "root@${HOST}" \
+            | ssh "ubuntu@${HOST}" \
               'kubectl --kubeconfig ~/.kube/config apply -f - &&
                kubectl --kubeconfig ~/.kube/config -n demo rollout status deploy/demo-app --timeout=180s'
