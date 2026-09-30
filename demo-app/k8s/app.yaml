@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-app
+    spec:
+      containers:
+        - name: demo-app
+          image: IMAGE_PLACEHOLDER   # replaced by the CI/CD pipeline
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 128Mi }   # /leak will hit this and get OOMKilled
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+spec:
+  selector:
+    app.kubernetes.io/name: demo-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Tells Prometheus to scrape /metrics every 30s
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-app
+  namespace: demo
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+# Exposes the app on http://YOUR_SERVER_IP/ through Traefik
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-app
+  namespace: demo
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-app
+                port:
+                  number: 80
+---
+# Alerts the AI assistant will analyze
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-app
+  namespace: demo
+spec:
+  groups:
+    - name: demo-app
+      rules:
+        - alert: DemoAppHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="demo", status=~"5.."}[2m]))
+              / sum(rate(http_requests_total{namespace="demo"}[2m])) > 0.2
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "demo-app error rate above 20%"
+            description: "{{ $value | humanizePercentage }} of requests are failing with 5xx."
+        - alert: DemoAppHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="demo"}[5m]))) > 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "demo-app p95 latency above 1s"
+            description: "p95 latency is {{ $value | humanizeDuration }}."
+        - alert: DemoAppRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo"}[5m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "demo-app container restarted"
+            description: "Pod {{ $labels.pod }} restarted in the last 5 minutes (crash or OOMKilled)."
