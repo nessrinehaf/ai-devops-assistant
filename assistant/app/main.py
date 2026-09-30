@@ -21,6 +21,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s ai-assistant %(message)s",
 )
 log = logging.getLogger("ai-assistant")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (they can contain secrets)
 
 # --- Configuration (environment variables) ---------------------------------
 PROMETHEUS_URL = os.getenv(
