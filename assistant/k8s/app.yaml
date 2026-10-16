@@ -61,6 +61,12 @@ spec:
               value: http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090
             - name: LOKI_URL
               value: http://loki.monitoring.svc:3100
+            # USD per million tokens for the cost estimate (gpt-5-mini prices;
+            # update these if you change model)
+            - name: LLM_INPUT_PRICE_PER_M
+              value: "0.25"
+            - name: LLM_OUTPUT_PRICE_PER_M
+              value: "2.00"
           # LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, DISCORD_WEBHOOK_URL
           # come from a secret you create by hand (never commit keys to git)
           envFrom:
@@ -85,6 +91,8 @@ kind: Service
 metadata:
   name: ai-assistant
   namespace: assistant
+  labels:
+    app.kubernetes.io/name: ai-assistant
 spec:
   selector:
     app.kubernetes.io/name: ai-assistant
@@ -92,3 +100,51 @@ spec:
     - name: http
       port: 80
       targetPort: http
+---
+# Tells Prometheus to scrape the assistant's own /metrics every 30s
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ai-assistant
+  namespace: assistant
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-assistant
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+---
+# Alerts about the assistant itself. Note: they go through Alertmanager to the
+# assistant, so if the assistant is broken they may not reach Discord.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ai-assistant
+  namespace: assistant
+spec:
+  groups:
+    - name: ai-assistant
+      rules:
+        - alert: AIAssistantAnalysisFailing
+          expr: sum(increase(ai_assistant_analyses_total{result!="success"}[15m])) >= 2
+          labels:
+            severity: warning
+          annotations:
+            summary: "AI assistant analyses are failing"
+            description: "{{ $value | humanize }} analyses failed or got no LLM answer in the last 15 minutes."
+        - alert: AIAssistantBudgetReached
+          expr: sum(increase(ai_assistant_alerts_skipped_total{reason="hourly_budget_reached"}[15m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "AI assistant hourly analysis budget reached"
+            description: "Alerts are being skipped because MAX_ANALYSES_PER_HOUR was reached."
+        - alert: AIAssistantNotificationsFailing
+          expr: sum(increase(ai_assistant_notifications_total{result="failed"}[15m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "AI assistant cannot post to Discord"
+            description: "Discord webhook calls failed in the last 15 minutes."

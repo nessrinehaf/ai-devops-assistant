@@ -92,10 +92,11 @@ The demo app's `/leak` endpoint was called until the container hit its memory li
 │   ├── k8s/app.yaml           # Deployment, Service, Ingress, ServiceMonitor, alert rules
 │   └── Dockerfile
 ├── assistant/                 # The AI DevOps Assistant
-│   ├── app/main.py            # Webhook, context gathering, LLM call, notification
+│   ├── app/main.py            # Webhook, context gathering, LLM call, notification, /metrics
 │   ├── tests/
-│   ├── k8s/app.yaml           # Deployment, Service, read-only RBAC
+│   ├── k8s/app.yaml           # Deployment, Service, read-only RBAC, ServiceMonitor, self-alerts
 │   └── Dockerfile
+├── dashboards/                # Grafana dashboard for the assistant itself
 ├── infra/monitoring/          # Helm values for Prometheus, Loki and Alloy
 └── .github/workflows/         # One CI/CD pipeline per service
 ```
@@ -222,13 +223,14 @@ ssh -t -L 9090:localhost:9090 -L 3100:localhost:3100 ubuntu@SERVER_IP \
 docker run -d --name grafana -p 3000:3000 grafana/grafana
 ```
 
-Add the data sources `http://host.docker.internal:9090` (Prometheus) and `http://host.docker.internal:3100` (Loki), then import dashboards **1860** and **15757**.
+Add the data sources `http://host.docker.internal:9090` (Prometheus) and `http://host.docker.internal:3100` (Loki), then import dashboards **1860** and **15757**, plus `dashboards/ai-assistant-dashboard.json` (Dashboards → New → Import → Upload JSON) for the assistant's own metrics.
 
 </details>
 
 ## Roadmap
 
 - [ ] Post a "resolved" message when an alert clears
-- [ ] Metrics about the assistant itself (analyses, LLM latency, cost)
+- [x] Metrics about the assistant itself (analyses, LLM latency, tokens, cost) with a Grafana dashboard and self-alerts
+- [ ] A second notification channel for the assistant's own alerts (today they go through the assistant itself)
 - [ ] HTTPS with Let's Encrypt
 - [ ] Remember past incidents, so similar alerts can reference earlier diagnoses

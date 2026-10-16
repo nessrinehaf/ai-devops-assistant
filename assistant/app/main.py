@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +37,9 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 MAX_ANALYSES_PER_HOUR = int(os.getenv("MAX_ANALYSES_PER_HOUR", "20"))
 LOG_LINES = int(os.getenv("LOG_LINES", "40"))
+# USD per million tokens, used to estimate cost (check your provider's pricing page)
+LLM_INPUT_PRICE_PER_M = float(os.getenv("LLM_INPUT_PRICE_PER_M", "0"))
+LLM_OUTPUT_PRICE_PER_M = float(os.getenv("LLM_OUTPUT_PRICE_PER_M", "0"))
 MAX_PROMPT_CHARS = 12000
 
 IGNORED_ALERTS = {"Watchdog", "InfoInhibitor"}
@@ -58,6 +62,48 @@ app = FastAPI(title="AI DevOps Assistant")
 # In-memory state for cost control (resets when the pod restarts, which is fine)
 _last_analyzed: dict[str, float] = {}
 _recent_analyses: list[float] = []
+
+# --- Self-monitoring metrics (scraped by Prometheus at /metrics) ---------------
+DURATION_BUCKETS = (1, 2, 5, 10, 20, 30, 60, 120, 180)
+ALERTS_RECEIVED = Counter(
+    "ai_assistant_alerts_received_total", "Alerts received from Alertmanager", ["alertname"]
+)
+ALERTS_SKIPPED = Counter(
+    "ai_assistant_alerts_skipped_total", "Alerts not analyzed, by reason", ["reason"]
+)
+ANALYSES = Counter(
+    "ai_assistant_analyses_total", "Finished analyses, by result", ["result"]
+)
+ANALYSIS_DURATION = Histogram(
+    "ai_assistant_analysis_duration_seconds", "End-to-end time to analyze one alert",
+    buckets=DURATION_BUCKETS,
+)
+LLM_DURATION = Histogram(
+    "ai_assistant_llm_request_duration_seconds", "Time spent waiting for the LLM",
+    buckets=DURATION_BUCKETS,
+)
+LLM_TOKENS = Counter(
+    "ai_assistant_llm_tokens_total", "Tokens used, by type (input or output)", ["type"]
+)
+LLM_COST = Counter(
+    "ai_assistant_llm_cost_usd_total", "Estimated LLM cost in USD"
+)
+CONTEXT_ERRORS = Counter(
+    "ai_assistant_context_errors_total", "Failed context lookups, by source", ["source"]
+)
+NOTIFICATIONS = Counter(
+    "ai_assistant_notifications_total", "Discord messages, by result", ["result"]
+)
+
+# Create the series at 0 so dashboards and rate() work before the first incident
+for _result in ("success", "llm_error", "failed"):
+    ANALYSES.labels(result=_result)
+for _type in ("input", "output"):
+    LLM_TOKENS.labels(type=_type)
+for _source in ("prometheus", "kubernetes", "loki"):
+    CONTEXT_ERRORS.labels(source=_source)
+for _result in ("sent", "failed"):
+    NOTIFICATIONS.labels(result=_result)
 
 
 # --- Small helpers -----------------------------------------------------------
@@ -85,6 +131,11 @@ def alert_expr(alert: dict) -> str | None:
     query = parse_qs(urlparse(alert.get("generatorURL", "")).query)
     exprs = query.get("g0.expr")
     return exprs[0] if exprs else None
+
+
+def estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    """Estimated USD cost of one LLM call, from the configured prices."""
+    return (input_tokens * LLM_INPUT_PRICE_PER_M + output_tokens * LLM_OUTPUT_PRICE_PER_M) / 1e6
 
 
 def truncate(text: str, limit: int) -> str:
@@ -151,6 +202,7 @@ async def metrics_context(client: httpx.AsyncClient, ns: str) -> str:
         try:
             return f"{title}: {await prom_query(client, q)}"
         except Exception as exc:  # keep going if one query fails
+            CONTEXT_ERRORS.labels(source="prometheus").inc()
             return f"{title}: (error: {exc})"
 
     return "\n".join(await asyncio.gather(*(one(t, q) for t, q in queries.items())))
@@ -234,20 +286,21 @@ async def gather_context(alert: dict) -> list[tuple[str, str]]:
     async with httpx.AsyncClient(timeout=15) as client:
         expr = alert_expr(alert)
         if expr:
-            jobs.append(("Alert expression, current value", prom_query(client, expr)))
+            jobs.append(("Alert expression, current value", "prometheus", prom_query(client, expr)))
         if ns:
-            jobs.append(("Kubernetes state", kubernetes_context(ns, pod)))
-            jobs.append((f"Metrics for namespace {ns}", metrics_context(client, ns)))
-            jobs.append(("Error/warning logs from Loki (last 15 min)", loki_context(client, ns, pod)))
+            jobs.append(("Kubernetes state", "kubernetes", kubernetes_context(ns, pod)))
+            jobs.append((f"Metrics for namespace {ns}", "prometheus", metrics_context(client, ns)))
+            jobs.append(("Error/warning logs from Loki (last 15 min)", "loki", loki_context(client, ns, pod)))
 
-        async def safe(coro):
+        async def safe(source, coro):
             try:
                 return await coro
             except Exception as exc:
+                CONTEXT_ERRORS.labels(source=source).inc()
                 return f"(unavailable: {exc})"
 
-        results = await asyncio.gather(*(safe(c) for _, c in jobs))
-    return [(title, result) for (title, _), result in zip(jobs, results)]
+        results = await asyncio.gather(*(safe(s, c) for _, s, c in jobs))
+    return [(title, result) for (title, _, _), result in zip(jobs, results)]
 
 
 # --- LLM and notification -----------------------------------------------------
@@ -284,27 +337,40 @@ def llm_request_body(user_prompt: str) -> dict:
     return body
 
 
-async def ask_llm(user_prompt: str) -> str:
+def record_usage(usage: dict) -> None:
+    """Count tokens and estimated cost from an OpenAI-style 'usage' object."""
+    input_tokens = int(usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or 0)  # includes reasoning tokens
+    LLM_TOKENS.labels(type="input").inc(input_tokens)
+    LLM_TOKENS.labels(type="output").inc(output_tokens)
+    LLM_COST.inc(estimate_cost(input_tokens, output_tokens))
+
+
+async def ask_llm(user_prompt: str) -> tuple[str, bool]:
+    """Return (text, ok). On failure the text explains what went wrong."""
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
-        return "(LLM not configured: set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL)"
+        return "(LLM not configured: set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL)", False
     url = f"{LLM_BASE_URL}/chat/completions"
     headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
     body = llm_request_body(user_prompt)
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, headers=headers, json=body)
-        if r.status_code == 400:
-            # Some models reject optional parameters: retry with the bare minimum
-            log.warning("LLM rejected parameters (%s), retrying without them", r.text[:200])
-            r = await client.post(
-                url, headers=headers, json={"model": body["model"], "messages": body["messages"]}
-            )
-        if r.status_code >= 400:
-            return f"(LLM request failed: HTTP {r.status_code}: {r.text[:300]})"
-        choice = r.json()["choices"][0]
-        content = (choice.get("message", {}).get("content") or "").strip()
-        if not content:
-            return f"(LLM returned no text, finish_reason={choice.get('finish_reason')})"
-        return content
+    with LLM_DURATION.time():
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, headers=headers, json=body)
+            if r.status_code == 400:
+                # Some models reject optional parameters: retry with the bare minimum
+                log.warning("LLM rejected parameters (%s), retrying without them", r.text[:200])
+                r = await client.post(
+                    url, headers=headers, json={"model": body["model"], "messages": body["messages"]}
+                )
+    if r.status_code >= 400:
+        return f"(LLM request failed: HTTP {r.status_code}: {r.text[:300]})", False
+    data = r.json()
+    record_usage(data.get("usage") or {})
+    choice = data["choices"][0]
+    content = (choice.get("message", {}).get("content") or "").strip()
+    if not content:
+        return f"(LLM returned no text, finish_reason={choice.get('finish_reason')})", False
+    return content, True
 
 
 async def notify(alert: dict, analysis: str) -> None:
@@ -319,8 +385,13 @@ async def notify(alert: dict, analysis: str) -> None:
         return
     async with httpx.AsyncClient(timeout=15) as client:
         for chunk in split_message(text):
-            r = await client.post(DISCORD_WEBHOOK_URL, json={"content": chunk})
-            r.raise_for_status()
+            try:
+                r = await client.post(DISCORD_WEBHOOK_URL, json={"content": chunk})
+                r.raise_for_status()
+            except Exception:
+                NOTIFICATIONS.labels(result="failed").inc()
+                raise
+            NOTIFICATIONS.labels(result="sent").inc()
 
 
 async def process_alert(alert: dict) -> None:
@@ -328,17 +399,26 @@ async def process_alert(alert: dict) -> None:
     started = time.perf_counter()
     try:
         context = await gather_context(alert)
-        analysis = await ask_llm(build_prompt(alert, context))
+        analysis, ok = await ask_llm(build_prompt(alert, context))
         await notify(alert, analysis)
+        ANALYSES.labels(result="success" if ok else "llm_error").inc()
         log.info("processed %s in %.1fs", name, time.perf_counter() - started)
     except Exception:
+        ANALYSES.labels(result="failed").inc()
         log.exception("failed to process alert %s", name)
+    finally:
+        ANALYSIS_DURATION.observe(time.perf_counter() - started)
 
 
 # --- HTTP endpoints -------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/alert")
@@ -349,10 +429,12 @@ async def receive_alert(request: Request, background: BackgroundTasks):
     accepted = []
     for alert in payload.get("alerts", []):
         name = alert.get("labels", {}).get("alertname")
+        ALERTS_RECEIVED.labels(alertname=name or "unknown").inc()
         ok, reason = claim_alert(alert, now)
         if ok:
             background.add_task(process_alert, alert)
             accepted.append(name)
         else:
+            ALERTS_SKIPPED.labels(reason=reason.replace(" ", "_")).inc()
             log.info("skipping %s: %s", name, reason)
     return {"accepted": accepted}
