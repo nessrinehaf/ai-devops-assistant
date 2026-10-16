@@ -57,3 +57,18 @@ def test_other_provider_body(monkeypatch):
     monkeypatch.setattr(main, "LLM_BASE_URL", "https://api.groq.com/openai/v1")
     body = main.llm_request_body("hi")
     assert body["max_tokens"] == 700
+
+
+def test_estimate_cost(monkeypatch):
+    monkeypatch.setattr(main, "LLM_INPUT_PRICE_PER_M", 0.25)
+    monkeypatch.setattr(main, "LLM_OUTPUT_PRICE_PER_M", 2.00)
+    # 4000 input + 1000 output tokens = 0.001 + 0.002 USD
+    assert abs(main.estimate_cost(4000, 1000) - 0.003) < 1e-12
+
+
+def test_metrics_endpoint():
+    from fastapi.testclient import TestClient
+
+    body = TestClient(main.app).get("/metrics").text
+    assert 'ai_assistant_analyses_total{result="success"} 0.0' in body
+    assert "ai_assistant_llm_cost_usd_total" in body
